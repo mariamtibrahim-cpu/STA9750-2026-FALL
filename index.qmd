@@ -1,0 +1,17 @@
+---
+title: "STA 9750 Homepage"
+---
+
+# Welcome to My STA 9750 Website
+
+Hello! My name is Mariam Ibrahim, and this website contains my coursework and mini-projects for STA 9750 at Baruch College.
+
+I will use this website to share my progress and submissions throughout the semester.
+
+---
+Last Updated:
+
+```{r}
+#| echo: false
+cat(format(Sys.time(), "%A %m %d, %Y at %H:%M%p"))
+```
