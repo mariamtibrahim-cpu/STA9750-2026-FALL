@@ -1,0 +1,459 @@
+**Your document must start the `---` below**
+---
+title: "Mini-Project 01 - What We Watched: Exploring Netflix Viewing Data"
+author: "mariamtibrahim-cpu."
+editor:
+    mode: source
+format:
+    html:
+        code-fold: true
+---
+
+## Introduction
+
+In this mini-project, I aim to demonstrate my skills in data summarization, exploratory data analysis, and table formatting by examining Netflix viewing data from January 2023 to January 2026. The project explores which titles receive the most viewing hours and how viewing trends change over time. I compare Netflix’s catalog size, recurring popular titles, movies and TV shows, and live events. Through this analysis, I hope to identify Netflix’s most popular content and gain a better understanding of viewers’ preferences and watching habits.
+
+## Data Acquisition and Preparation
+
+```{r}
+library(tidyverse)
+library(rvest)
+library(readxl)
+library(fs)
+library(lubridate)
+library(gt)
+library(skimr)
+library(scales)
+```
+```{r}
+load_netflix_data <- function(){                                               
+# Note to students: Make sure you have installed the tidyverse and fs packages
+  #                   before beginning this assignment. If you aren't sure,
+  #                   simply run `library(tidyverse)` at your R Console and, if
+  #                   you don't see an error message, `tidyverse` has been 
+  #                   installed. (Same for `fs`) If you still need to install
+  #                   either package, use the `install.packages` function as 
+  #                   demonstrated in class.
+  library(tidyverse)
+  library(rvest)
+  library(readxl)
+  library(fs)
+  
+  data_dir <- path("data", "mp01")
+    
+  if(!dir_exists(data_dir)){
+    dir_create(data_dir, showWarnings=FALSE, recurse=TRUE)
+  }
+  
+  NETFLIX_URLS <- list(
+    `2023H1` = "https://about.netflix.com/news/what-we-watched-a-netflix-engagement-report",
+    `2023H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2023",
+    `2024H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2024",
+    `2024H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2024",
+    `2025H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2025",
+    `2025H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2025",
+    `2026H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2026"
+  )
+  
+  download_if_needed <- function(url, local){
+    if(!file_exists(local)){
+      download.file(url, local, quiet = TRUE, mode = "wb")
+    }
+    
+    return(local)
+  }
+    
+  NETFLIX_URLS |> 
+    map(read_html) |> 
+    map(html_element, xpath = "//a[contains(@href, '.xlsx')]") |> 
+    map_chr(html_attr, "href") |> 
+    enframe("period", "url") |> 
+   mutate(path = path(data_dir, paste0(period, ".xlsx")), 
+          path = map2(url, path, download_if_needed), 
+          data = map(path, read_excel, skip=3, na="*"), 
+          data = map(data, \(x) x |> mutate(`Release Date` = as.Date(`Release Date`)))) |>
+    unnest(data) |> 
+    select(-url, -path) |> 
+    mutate(year=str_sub(period, 1, 4), 
+           half=str_sub(period, start=6), 
+           period_start = make_date(year, if_else(half==1, 1, 7), 1), 
+           period_end = make_date(year, if_else(half==1, 6, 12), if_else(half==1, 30, 31))) |> 
+    filter(!is.na(`Hours Viewed`)) |> 
+    mutate(live_event = !is.na(Runtime) & str_detect(Runtime, "\\d+:\\d+\\*"), 
+           clean_time = str_remove(Runtime, fixed("*")),
+           Runtime = 60 * hour(hm(clean_time)) + minute(hm(clean_time))) |>
+    select(-clean_time) |>
+    mutate(Runtime = coalesce(Runtime, mean(Runtime, na.rm=TRUE)), 
+           .by=Title, 
+           Title = stringi::stri_trans_general(Title, "Latin-ASCII"),
+           Title = str_remove(Title, " // .*"), 
+           Title = str_remove(Title, "[^[:ascii:]].*"), 
+           Title = str_trim(Title)) |>
+    filter_out(Title == "") |>
+    select(year, 
+           period, 
+           period_start, 
+           period_end, 
+           Title, 
+           -half, 
+           Runtime, 
+           Views, 
+           `Hours Viewed`, 
+           `Release Date`,
+           `Available Globally?`, 
+           live_event)
+}
+
+NETFLIX_DATA <- load_netflix_data()
+```
+```{r}
+NETFLIX_DATA <- NETFLIX_DATA |>
+  rename(
+    title = Title,
+    hours_viewed = `Hours Viewed`,
+    available_globally = `Available Globally?`,
+    release_date = `Release Date`
+  ) |>
+  rename_with(\(x) tolower(x)) |>
+  rename_with(\(x) gsub("[^a-z0-9]+", "_", x))
+```
+```{r}
+NETFLIX_DATA <- NETFLIX_DATA |>
+  mutate(
+    year = as.integer(year),
+    available_globally = case_when(
+      available_globally == "Yes" ~ TRUE,
+      available_globally == "No" ~ FALSE,
+      TRUE ~ NA
+    )
+  )
+```
+Remember that code blocks look like this: 
+
+```{r}
+# Your code goes in chunks like this
+library(tidyverse) # You will want this line for almost all MPs
+x <- 1 + 2 + 3
+```
+
+and you can then print variables from chunks: 
+
+```{r}
+x
+```
+
+or inline, like this: $x$ is `r x`.
+
+## Exploratory Analysis
+```{r}
+glimpse(NETFLIX_DATA)
+summary(NETFLIX_DATA)
+skimr::skim(NETFLIX_DATA)
+```
+### Exploratory Questions
+**1. Date range:** The Netflix viewing data covers January 1, 2023, through June 30, 2026.
+
+**2. Distinct titles:** The dataset contains 24,427 distinct titles.
+
+**3. Bridgerton universe:** Titles containing “Bridgerton” accumulated 4,862,800,000 total viewing hours.
+
+**4. Stranger Things:** The five seasons listed in the analysis accumulated 5,548,500,000 total viewing hours.
+
+**5. Top 10 titles in 2026H1:** The ten most-viewed titles accounted for 6.70% of total viewing hours in the first half of 2026.
+
+**6. Global availability:** Approximately 24.6% of distinct titles were marked globally available, accounting for approximately 54.3% of total viewing hours.
+
+1. What is the date range covered by the Netflix viewing data?**
+
+```{r}
+NETFLIX_DATA |>
+  summarise(
+    first_period_start = min(period_start, na.rm = TRUE),
+    last_period_end = max(period_end, na.rm = TRUE)
+  )
+```
+
+**2. How many distinct titles are included in the dataset?**
+
+```{r}
+NETFLIX_DATA |>
+  summarise(distinct_titles = n_distinct(title))
+```
+```
+```{r}
+range(NETFLIX_DATA$period_start)
+range(NETFLIX_DATA$period_end)
+```
+```{r}
+n_distinct(NETFLIX_DATA$title)
+```
+```{r}
+NETFLIX_DATA |>
+  filter(str_detect(title, regex("Bridgerton", ignore_case = TRUE))) |>
+  summarise(total_hours_viewed = sum(hours_viewed, na.rm = TRUE))
+```
+```{r}
+NETFLIX_DATA |>
+  filter(title %in% c(
+    "Stranger Things",
+    "Stranger Things 2",
+    "Stranger Things 3",
+    "Stranger Things 4",
+    "Stranger Things 5"
+  )) |>
+  summarise(total_hours_viewed = sum(hours_viewed, na.rm = TRUE))
+```
+```{r}
+NETFLIX_DATA |>
+  filter(str_detect(title, regex("Stranger Things", ignore_case = TRUE))) |>
+  distinct(title) |>
+  arrange(title)
+```
+```{r}
+top10_2026H1 <- NETFLIX_DATA |>
+  filter(period == "2026H1") |>
+  slice_max(order_by = hours_viewed, n = 10, with_ties = FALSE)
+
+top10_2026H1 |>
+  summarise(
+    top10_hours = sum(hours_viewed, na.rm = TRUE),
+    total_hours = sum(NETFLIX_DATA$hours_viewed[NETFLIX_DATA$period == "2026H1"], na.rm = TRUE),
+    percentage = 100 * top10_hours / total_hours
+  )
+```
+```{r}
+global_availability <- NETFLIX_DATA |>
+  group_by(title) |>
+  summarise(
+    globally_available = any(available_globally %in% TRUE),
+    hours_viewed = sum(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  summarise(
+    fraction_titles_global = mean(globally_available),
+    fraction_hours_global =
+      sum(hours_viewed[globally_available]) / sum(hours_viewed)
+  )
+
+global_availability
+```
+ 
+## Final Insights and Deliverable
+```{r}
+period_leaders <- NETFLIX_DATA |>
+  group_by(period) |>
+  mutate(period_total_hours = sum(hours_viewed, na.rm = TRUE)) |>
+  slice_max(hours_viewed, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(share_of_viewing = hours_viewed / period_total_hours)
+
+period_leaders |>
+  select(period, title, hours_viewed, share_of_viewing) |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Netflix's Most-Watched Title by Reporting Period",
+    subtitle = "Viewing hours and share of total reported viewing"
+  ) |>
+  gt::fmt_number(columns = hours_viewed, decimals = 0, use_seps = TRUE) |>
+  gt::fmt_percent(columns = share_of_viewing, decimals = 1)
+```
+```{r}
+catalog_size <- NETFLIX_DATA |>
+  group_by(period) |>
+  summarise(
+    title_count = n_distinct(title),
+    total_runtime_hours = sum(runtime, na.rm = TRUE) / 60,
+    .groups = "drop"
+  ) |>
+  arrange(period) |>
+  mutate(
+    title_change = title_count - lag(title_count),
+    runtime_change_hours = total_runtime_hours - lag(total_runtime_hours)
+  )
+
+catalog_size |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Netflix Catalog Size Over Time",
+    subtitle = "Distinct titles and estimated runtime by reporting period"
+  ) |>
+  gt::fmt_number(
+    columns = c(title_count, title_change),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  gt::fmt_number(
+    columns = c(total_runtime_hours, runtime_change_hours),
+    decimals = 1,
+    use_seps = TRUE
+  )
+```
+```{r}
+consistent_titles <- NETFLIX_DATA |>
+  group_by(title) |>
+  summarise(
+    periods_present = n_distinct(period),
+    average_hours = mean(hours_viewed, na.rm = TRUE),
+    total_hours = sum(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(periods_present >= 5) |>
+  slice_max(order_by = average_hours, n = 10, with_ties = FALSE)
+```
+```{r}
+consistent_titles |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Netflix's Most Consistent High-Viewership Titles",
+    subtitle = "Titles appearing in at least five reporting periods"
+  ) |>
+  gt::fmt_number(
+    columns = c(periods_present),
+    decimals = 0
+  ) |>
+  gt::fmt_number(
+    columns = c(average_hours, total_hours),
+    decimals = 0,
+    use_seps = TRUE
+  )
+``` 
+```{r}
+consistent_titles <- NETFLIX_DATA |>
+  group_by(title) |>
+  summarise(
+    periods_present = n_distinct(period),
+    average_hours = mean(hours_viewed, na.rm = TRUE),
+    total_hours = sum(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(periods_present >= 5) |>
+  slice_max(order_by = average_hours, n = 10, with_ties = FALSE)
+```
+```{r}
+title_type_summary <- NETFLIX_DATA |>
+  mutate(
+    title_type = if_else(
+      str_detect(title, regex("Season", ignore_case = TRUE)) |
+        runtime > 240,
+      "Show",
+      "Movie"
+    )
+  ) |>
+  group_by(title_type) |>
+  summarise(
+    total_hours = sum(hours_viewed, na.rm = TRUE),
+    title_count = n_distinct(title),
+    .groups = "drop"
+  ) |>
+  mutate(
+    share_of_hours = total_hours / sum(total_hours)
+  )
+title_type_summary <- NETFLIX_DATA |>
+  mutate(
+    title_type = case_when(
+      is.na(runtime) ~ "Unknown",
+      str_detect(title, regex("Season", ignore_case = TRUE)) |
+        runtime > 240 ~ "Show",
+      TRUE ~ "Movie"
+    )
+  ) |>
+  group_by(title_type) |>
+  summarise(
+    total_hours = sum(hours_viewed, na.rm = TRUE),
+    title_count = n_distinct(title),
+    .groups = "drop"
+  ) |>
+  mutate(share_of_hours = total_hours / sum(total_hours))
+
+title_type_summary |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Netflix Viewing: Shows vs. Movies",
+    subtitle = "A title-classification heuristic based on names and runtime"
+  ) |>
+  gt::fmt_number(
+    columns = c(total_hours, title_count),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  gt::fmt_percent(
+    columns = share_of_hours,
+    decimals = 1
+  )
+```
+
+```{r}
+title_type_summary <- NETFLIX_DATA |>
+  mutate(
+   title_type = case_when(
+  is.na(runtime) ~ "Unknown",
+  str_detect(title, regex("Season", ignore_case = TRUE)) |
+    runtime > 240 ~ "Show",
+  TRUE ~ "Movie"
+)
+  ) |>
+  group_by(title_type) |>
+  summarise(
+    total_hours = sum(hours_viewed, na.rm = TRUE),
+    title_count = n_distinct(title),
+    .groups = "drop"
+  ) |>
+  mutate(
+    share_of_hours = total_hours / sum(total_hours)
+  )
+
+title_type_summary |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Netflix Viewing: Shows vs. Movies",
+    subtitle = "Approximate classification based on title names and runtime"
+  ) |>
+  gt::fmt_number(
+    columns = c(total_hours, title_count),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  gt::fmt_percent(
+    columns = share_of_hours,
+    decimals = 1
+  )
+```
+```{r}
+live_event_summary <- NETFLIX_DATA |>
+  mutate(
+    event_type = if_else(
+      live_event,
+      "Live Event",
+      "Not Live Event"
+    )
+  ) |>
+  group_by(event_type) |>
+  summarise(
+    title_count = n_distinct(title),
+    total_hours = sum(hours_viewed, na.rm = TRUE),
+    average_hours = mean(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+live_event_summary |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Netflix Viewing: Live vs. Non-Live",
+    subtitle = "Catalog counts and viewing-hour performance"
+  ) |>
+  gt::fmt_number(
+    columns = c(title_count, total_hours, average_hours),
+    decimals = 0,
+    use_seps = TRUE
+  )
+```
+
+
+
+------------------------------------------------------------------------
+
+This work ©2025 by mariamtibrahim-cpu was initially prepared as a Mini-Project for
+STA 9750 at Baruch College. More details about this course can be found at
+[the course site](https://michael-weylandt.com/STA9750) and instructions for
+this assignment can be found at 
+[MP #01](https://michael-weylandt.com/STA9750/mini/mini01.html)
