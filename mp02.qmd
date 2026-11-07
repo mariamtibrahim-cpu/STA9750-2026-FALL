@@ -1,0 +1,460 @@
+Mini-Project 02 - Identifying Environmentally Responsible US Public Transit Systems
+---
+title: "Mini-Project 02 - Identifying Environmentally Responsible US Public Transit Systems"
+author: "mariamtibrahim-cpu"
+editor:
+    mode: source
+format:
+    html:
+        code-fold: true
+---
+
+Public transportation plays an important role in reducing the environmental impact of transportation in the United States.This project examines energy consumption, electricity emissions, and transit service data to explore how environmental responsibility varies across U.S. public transportation systems.
+
+## Data Acquisition and Preparation
+```{r}
+library(tidyverse)
+library(stringr)
+library(httr2)
+library(rvest)
+library(fs)
+library(readxl)
+```
+```{r}
+get_eia_sep <- function(state, abbr){
+    library(tidyverse)
+    library(stringr)
+    library(httr2)
+    library(rvest)
+    library(fs)
+  
+    state_formatted <- str_to_lower(state) |> str_replace_all("\\s", "")
+    
+    dir_name <- fs::path("data", "mp02")
+    file_name <- fs::path(dir_name, state_formatted)
+    
+    fs::dir_create(dir_name, recurse=TRUE)
+    
+    if(!fs::file_exists(file_name)){
+        BASE_URL <- "https://www.eia.gov"
+        RESPONSE <- request(BASE_URL) |> 
+          req_url_path("electricity", 
+                       "state", 
+                       state_formatted) |>
+          req_headers(
+            `User-Agent` = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0"
+            ) |>   
+          req_retry(
+                max_tries = 4, 
+          ) |>
+          req_perform(file_name)
+    
+        resp_check_status(RESPONSE)
+    }
+    
+    TABLE <- read_html(file_name) |> 
+        html_element("table") |> 
+        html_table() |>
+        mutate(Item = str_to_lower(Item))
+    
+    if("U.S. rank" %in% colnames(TABLE)){
+        TABLE <- TABLE |> rename(Rank = `U.S. rank`)
+    }
+    
+    CO2_MWh <- TABLE |> 
+        filter(Item == "carbon dioxide (lbs/mwh)") |>
+        pull(Value) |> 
+        str_replace_all(",", "") |>
+        as.numeric()
+    
+    PRIMARY <- TABLE |> 
+        filter(Item == "primary energy source") |> 
+        pull(Rank)
+    
+    RATE <- TABLE |>
+        filter(Item == "average retail price (cents/kwh)") |>
+        pull(Value) |>
+        as.numeric()
+    
+    GENERATION_MWh <- TABLE |>
+        filter(Item == "net generation (megawatthours)") |>
+        pull(Value) |>
+        str_replace_all(",", "") |>
+        as.numeric()
+    
+    data.frame(CO2_MWh               = CO2_MWh, 
+               primary_source        = PRIMARY,
+               electricity_price_MWh = RATE * 10, # / 100 cents to dollars &
+               # * 1000 kWh to MWH 
+               generation_MWh        = GENERATION_MWh, 
+               state                 = state, 
+               abbreviation          = abbr
+    )
+}
+
+EIA_SEP_REPORT <- map2(state.name, state.abb, get_eia_sep) |> list_rbind()
+```
+```{r}
+load_ntd_energy <- function(){
+  library(readxl)
+  library(httr2)
+  library(tidyverse)
+  library(fs)
+  
+  # Create 'data/mp02' directory if not already present
+  DATA_DIR <- fs::path("data", "mp02")
+  fs::dir_create(DATA_DIR, recurse=TRUE)
+
+NTD_ENERGY_FILE <- fs::path(DATA_DIR, "2025 Energy Consumption_260806.xlsx")
+  if(!fs::file_exists(NTD_ENERGY_FILE)){
+    library(httr2)
+  
+    request("https://www.transit.dot.gov/") |>
+      req_url_path("sites",
+                   "fta.dot.gov",
+                   "files",
+                   "2026-09",
+                   "2025 Energy Consumption_260806.xlsx") |> 
+      req_headers(
+        `User-Agent` = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0") |> 
+      req_perform(NTD_ENERGY_FILE)
+  }
+  
+  if(file.info(NTD_ENERGY_FILE)$size < 1e4){
+        cat("I was unable to download the NTD Energy File. Please try again.\n")
+        stop("Download failed. Please delete the corrupted file by running `unlink('data/mp02/2025_ntd_energy.xlsx')` and try again.")
+    }
+
+  to_numeric_fill_0 <- function(x){
+    x <- if_else(x == "-", NA, x)
+    replace_na(as.numeric(x), 0)
+  }
+
+  read_excel(NTD_ENERGY_FILE) |> 
+    select(-c(`Reporter Type`, 
+              `Reporting Module`, 
+              `Gallons of Other Fuel`, 
+              `Other Fuel Description`)) |>
+    mutate(across(-c(`Agency Name`, 
+                     `Mode`,
+                     `TOS`), 
+                  to_numeric_fill_0)) |>
+    group_by(`NTD ID`, `Mode`, `Agency Name`) |>
+    summarize(across(where(is.numeric), sum), 
+              .groups = "keep") |>
+    mutate(ENERGY = sum(c_across(c(where(is.numeric))))) |>
+    filter(ENERGY > 0) |>
+    select(-ENERGY) |>
+    ungroup()
+}
+
+NTD_ENERGY <- load_ntd_energy()
+NTD_ENERGY <- NTD_ENERGY |>
+  mutate(Mode_Name = recode(Mode,
+    AR = "Alaska Railroad",
+    CB = "Commuter Bus",
+    CC = "Cable Car",
+    CR = "Commuter Rail",
+    DR = "Demand Response",
+    FB = "Ferryboat",
+    HR = "Heavy Rail",
+    IP = "Inclined Plane",
+    LR = "Light Rail",
+    MB = "Bus",
+    MG = "Monorail / Automated Guideway",
+    RB = "Bus Rapid Transit",
+    SR = "Streetcar Rail",
+    TB = "Trolleybus",
+    TR = "Aerial Tramway",
+    VP = "Vanpool",
+    YR = "Hybrid Rail"
+  ))
+```
+```{r}
+load_ntd_service <- function(){
+  library(httr2)
+  library(tidyverse)
+  library(fs)
+  
+  # Create 'data/mp02' directory if not already present
+  DATA_DIR <- fs::path("data", "mp02")
+  fs::dir_create(DATA_DIR, recurse=TRUE)
+
+  NTD_SERVICE_FILE <- fs::path(DATA_DIR, "2025_ntd_service.csv")
+
+  if(!fs::file_exists(NTD_SERVICE_FILE)){
+    library(httr2)
+  
+    request("https://data.transportation.gov/resource/4fir-qbim.csv") |>
+      req_url_query(`$query`=paste(
+        "SELECT  `_5_digit_ntd_id` AS `NTD_ID`", 
+        "`max_agency` AS `AGENCY`",
+        "`max_reporter_type` AS `reporter_type`",
+        "`max_organization_type` AS `organization_type`",
+        "`max_city` AS `city`",
+        "`max_state` AS `state`",
+        "`mode`",
+        "`type_of_service`",
+        "`max_primary_uza_code` as `uza_code`",
+        "`max_primary_uza_name` as `uza_name`",
+        "`max_primary_uza_area_sq_miles` as `uza_sq_miles`",
+        "`max_primary_uza_population` as `uza_population`",
+        "`max_service_area_sq_miles` as `service_area_sq_miles`",
+        "`max_service_area_population` as `service_area_population`",
+        "`questionable_record` as `flagged_likely_inaccurate`",
+        "`sum_unlinked_passenger_trips_upt` as `total_upt`",
+        "`sum_passenger_miles` WHERE caseless_one_of(`report_year`, '2025') limit 50000", 
+        sep=",")) |>
+      req_headers(
+        `User-Agent` = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0") |> 
+      req_perform(NTD_SERVICE_FILE)
+  }
+  
+  if(file.info(NTD_SERVICE_FILE)$size < 1e4){
+        cat("I was unable to download the NTD Service File. Please try again.\n")
+        stop("Download failed. Please delete the corrupted file by running `unlink('data/mp02/2025_ntd_service.xlsx')` and try again.")
+    }
+
+  read_csv(NTD_SERVICE_FILE) |>
+    mutate(flagged_likely_inaccurate = !is.na(flagged_likely_inaccurate))
+}
+
+NTD_SERVICE <- load_ntd_service()
+NTD_SERVICE <- NTD_SERVICE |>
+  mutate(mode_name = recode(mode,
+    AR = "Alaska Railroad",
+    CB = "Commuter Bus",
+    CC = "Cable Car",
+    CR = "Commuter Rail",
+    DR = "Demand Response",
+    FB = "Ferryboat",
+    HR = "Heavy Rail",
+    IP = "Inclined Plane",
+    LR = "Light Rail",
+    MB = "Bus",
+    MG = "Monorail / Automated Guideway",
+    RB = "Bus Rapid Transit",
+    SR = "Streetcar Rail",
+    TB = "Trolleybus",
+    TR = "Aerial Tramway",
+    VP = "Vanpool",
+    YR = "Hybrid Rail"
+  ))
+```
+
+
+Code related to Data Acquisition and Preparation goes here.
+
+Remember that code blocks look like this: 
+
+```{r}
+# Your code goes in chunks like this
+library(tidyverse) # You will want this line for almost all MPs
+x <- 1 + 2 + 3
+```
+
+and you can then print variables from chunks: 
+
+```{r}
+x
+```
+
+or inline, like this: $x$ is `r x`.
+
+## Exploratory Analysis
+```{r}
+weighted.mean(
+  EIA_SEP_REPORT$CO2_MWh,
+  EIA_SEP_REPORT$generation_MWh
+)
+```
+```{r}
+EIA_SEP_REPORT |>
+  arrange(desc(CO2_MWh)) |>
+  select(state, CO2_MWh) |>
+  head(10) |>
+  gt::gt() |>
+  gt::tab_header(title = "10 States with the Highest Electricity Emissions")
+```
+West Virginia had the highest reported electricity emissions, followed by Kentucky and Wyoming. These differences demonstrate why the environmental impact of electric transportation cannot be evaluated by electricity consumption alone. The emissions associated with generating that electricity must also be considered.
+```{r}
+EIA_SEP_REPORT |>
+  arrange(CO2_MWh) |>
+  select(state, CO2_MWh) |>
+  head(10) |>
+  gt::gt() |>
+  gt::tab_header(title = "10 States with the Lowest Electricity Emissions")
+```
+The analysis found that Vermont had the lowest reported electricity emissions, while Washington, New Hampshire, and South Dakota also ranked among the lowest-emission states. This suggests that electricity generation sources differ considerably across the United States. States with lower-emission electricity may offer a more environmentally favorable setting for electric public transportation.
+```{r}
+EIA_SEP_REPORT |>
+  arrange(CO2_MWh) |>
+  slice(c(1:10, (n() - 9):n())) |>
+  ggplot(aes(x = reorder(state, CO2_MWh), y = CO2_MWh)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "States with the Lowest and Highest Electricity Emissions",
+    x = "State",
+    y = "Pounds of CO2 per MWh"
+  ) +
+  theme_minimal()
+```
+```{r}
+NTD_ENERGY |>
+  group_by(Mode_Name) |>
+  summarise(
+    total_diesel = sum(`Gallons of Diesel Fuel`, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(total_diesel))
+```
+```{r}
+NTD_ENERGY |>
+  group_by(Mode_Name) |>
+  summarise(
+    total_diesel = sum(`Gallons of Diesel Fuel`, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(total_diesel > 0) |>
+  ggplot(aes(x = reorder(Mode_Name, total_diesel), y = total_diesel)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Diesel Consumption by Transit Mode",
+    x = "Transit Mode",
+    y = "Total Gallons of Diesel Fuel"
+  ) +
+  theme_minimal()
+```
+Bus transportation accounted for the greatest reported diesel consumption, with approximately 280.7 million gallons. Commuter rail followed with approximately 91.4 million gallons. This indicates that fuel consumption varies substantially by transit mode, although total consumption does not account for differences in service levels or passenger volume.
+```{r}
+NTD_ENERGY |>
+  group_by(`Agency Name`, Mode_Name) |>
+  summarise(
+    total_diesel = sum(`Gallons of Diesel Fuel`, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(total_diesel)) |>
+  head(10) |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "10 Agency and Transit Mode Combinations with the Highest Diesel Consumption"
+  )
+```
+```{r}
+NTD_SERVICE |>
+  group_by(mode_name) |>
+  summarise(
+    average_passenger_miles = mean(sum_passenger_miles, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(average_passenger_miles)) |>
+  head(10) |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Top 10 Transit Modes by Average Passenger Miles"
+  )
+```
+```{r}
+NTD_ENERGY |>
+  mutate(
+    total_energy = rowSums(
+      across(where(is.numeric)),
+      na.rm = TRUE
+    )
+  ) |>
+  arrange(desc(total_energy)) |>
+  select(`Agency Name`, Mode_Name, total_energy) |>
+  head(10) |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "10 Agencies with the Highest Reported Energy Consumption"
+  )
+```
+```{r}
+NTD_SERVICE |>
+  count(state, sort = TRUE) |>
+  head(10)
+```
+```{r}
+NTD_SERVICE |>
+  left_join(
+    EIA_SEP_REPORT,
+    by = c("state" = "abbreviation")
+  ) |>
+  summarise(
+    total_agencies = n(),
+    states_matched = sum(!is.na(CO2_MWh)),
+    average_electricity_emissions = mean(CO2_MWh, na.rm = TRUE)
+  )
+```
+```{r}
+3663 / 3762 * 100
+```
+```{r}
+names(NTD_ENERGY)
+```
+```{r}
+NTD_ENERGY |>
+  summarise(
+    battery_kwh = sum(`Kilowatt hours of Electric Battery`, na.rm = TRUE),
+    propulsion_kwh = sum(`Kilowatt hours of Electric Propulsion`, na.rm = TRUE),
+    total_electricity_kwh = battery_kwh + propulsion_kwh
+  )
+```
+```{r}
+total_electricity_kwh <- sum(
+  NTD_ENERGY$`Kilowatt hours of Electric Battery`,
+  NTD_ENERGY$`Kilowatt hours of Electric Propulsion`,
+  na.rm = TRUE
+)
+
+total_electricity_mwh <- total_electricity_kwh / 1000
+
+total_electricity_mwh * 753.0906
+```
+```{r}
+names(NTD_SERVICE)
+```
+```{r}
+head(NTD_ENERGY$`NTD ID`)
+head(NTD_SERVICE$NTD_ID)
+```
+```{r}
+NTD_ENERGY <- NTD_ENERGY |>
+  mutate(NTD_ID = str_pad(as.character(`NTD ID`), 5, pad = "0"))
+
+NTD_SERVICE <- NTD_SERVICE |>
+  mutate(NTD_ID = str_pad(NTD_ID, 5, pad = "0"))
+```
+```{r}
+TRANSIT_COMBINED <- NTD_ENERGY |>
+  left_join(
+    NTD_SERVICE,
+    by = c("NTD_ID", "Mode" = "mode")
+  ) |>
+  left_join(
+    EIA_SEP_REPORT,
+    by = c("state" = "abbreviation")
+  )
+```
+
+The three datasets were combined to examine relationships between transit energy consumption, service activity, and electricity emissions. Agency identification numbers were standardized before joining the datasets. Approximately 97.37% of transit service records successfully matched the state electricity information. The resulting combined dataset contained 1,314 rows and 39 columns.
+
+The preliminary electricity emissions estimate was approximately 5.10 billion pounds of CO₂. This estimate uses a weighted national average electricity emissions rate applied to total reported electricity consumption. It should therefore be interpreted as an overall estimate rather than a precise agency-level emissions calculation.
+
+
+
+## Final Insights and Deliverable
+
+The analysis demonstrates that the environmental impact of public transportation depends on several factors, including energy consumption, transportation mode, and the emissions associated with electricity generation. The findings show substantial differences in electricity emissions between states and diesel consumption between transit modes. However, total energy consumption alone does not determine environmental efficiency. Future analysis could improve these comparisons by incorporating passenger activity, agency-level emissions rates, and more detailed energy-use measurements.
+
+I used ChatGPT as a supplemental learning and coding assistance tool while completing this project. It helped me troubleshoot R code, understand data manipulation and dataset integration, and interpret certain analytical outputs. I reviewed the code and results, made decisions about the analysis, and take responsibility for the final project and its conclusions.
+------------------------------------------------------------------------
+
+This work ©2025 by mariamtibrahim-cpu was initially prepared as a Mini-Project for
+STA 9750 at Baruch College. More details about this course can be found at
+[the course site](https://michael-weylandt.com/STA9750) and instructions for
+this assignment can be found at 
+[MP #02](https://michael-weylandt.com/STA9750/mini/mini02.html)
